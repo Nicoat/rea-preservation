@@ -1,0 +1,68 @@
+name: Preserve REA snapshot
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: rea-preservation-2026-10-14
+  cancel-in-progress: false
+jobs:
+  archive:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Retrieve frozen seed and rebuild verified npm archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/contents/transfer-seed.zip?ref=$GITHUB_SHA" --jq .content | base64 --decode > seed.zip
+          echo 'e020482caee4f5ea7a1bf53407fddcdd406807628b0bc25aaa177f6ab46412d5  seed.zip' | sha256sum -c -
+          python3 -m zipfile -e seed.zip seed
+          python3 seed/build-npm-archive.py --output rea-npm-preservation-2026-10-14.zip
+          echo '417921f11a0aae1b53065ebddc6f34d578e90ed39dd9167d528a80072ce1d6c2  rea-npm-preservation-2026-10-14.zip' | sha256sum -c -
+      - name: Retrieve source archive and verify all preserved files
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 4 --output rea-source-preservation-2026-10-14.zip https://github.com/Nicoat/rea/releases/download/preservation-2026-10-14/rea-source-preservation-2026-10-14.zip
+          echo '4348e463a359fadb1725e86baf4d2d43247896994e45bafb72d1418fa54cd828  rea-source-preservation-2026-10-14.zip' | sha256sum -c -
+          python3 - <<'PY'
+          import hashlib, zipfile
+          from pathlib import Path
+          with zipfile.ZipFile('rea-source-preservation-2026-10-14.zip') as source, zipfile.ZipFile('rea-npm-preservation-2026-10-14.zip') as npm:
+              sums = source.read('FILES.sha256').decode().splitlines()
+              for line in sums:
+                  expected, path = line.split('  ', 1)
+                  z = npm if path.startswith('npm/') else source
+                  with z.open(path) as f:
+                      actual = hashlib.file_digest(f, 'sha256').hexdigest()
+                  if actual != expected:
+                      raise SystemExit('Checksum mismatch: ' + path)
+              Path('README-RESTORE.md').write_bytes(source.read('README-RESTORE.md'))
+              print('Verified all', len(sums), 'preserved files against the original per-file manifest.')
+          PY
+          sha256sum rea-source-preservation-2026-10-14.zip rea-npm-preservation-2026-10-14.zip README-RESTORE.md > SHA256SUMS.txt
+      - name: Publish complete archive after server-side verification
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/contents/RELEASE-NOTES.md?ref=$GITHUB_SHA" --jq .content | base64 --decode > RELEASE-NOTES.md
+          gh release create preservation-2026-10-14 --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "REA 完整保存快照 — 2026-10-14" --notes-file RELEASE-NOTES.md --draft --prerelease
+          gh release upload preservation-2026-10-14 --repo "$GITHUB_REPOSITORY" rea-source-preservation-2026-10-14.zip rea-npm-preservation-2026-10-14.zip README-RESTORE.md SHA256SUMS.txt
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/preservation-2026-10-14" > uploaded-release.json
+          python3 - <<'PY'
+          import hashlib, json
+          from pathlib import Path
+          release = json.loads(Path('uploaded-release.json').read_text())
+          assets = {a['name']: a for a in release['assets']}
+          names = ['rea-source-preservation-2026-10-14.zip', 'rea-npm-preservation-2026-10-14.zip', 'README-RESTORE.md', 'SHA256SUMS.txt']
+          for name in names:
+              path = Path(name)
+              with path.open('rb') as f: digest = hashlib.file_digest(f, 'sha256').hexdigest()
+              assert assets[name]['size'] == path.stat().st_size, name
+              assert assets[name]['digest'] == 'sha256:' + digest, name
+          print('All four GitHub assets match their local file sizes and SHA256 digests.')
+          PY
+          gh release edit preservation-2026-10-14 --repo "$GITHUB_REPOSITORY" --draft=false --prerelease
